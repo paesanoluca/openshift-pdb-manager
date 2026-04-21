@@ -2,6 +2,7 @@
 
 # PDB Backup and Restore Script for OpenShift/ROSA
 # Skips OpenShift system namespaces
+# Backup/Delete limited to PDBs with status.disruptionsAllowed > 0
 
 BACKUP_DIR="./pdb-backups"
 TIMESTAMP=$(date +%Y%m%d-%H%M%S)
@@ -30,6 +31,17 @@ get_user_namespaces() {
     echo "$user_ns"
 }
 
+pdb_allowed_disruptions() {
+    local pdb="$1"
+    local ns="$2"
+
+    local allowed
+    allowed=$(oc get pdb "$pdb" -n "$ns" \
+        -o jsonpath='{.status.disruptionsAllowed}' 2>/dev/null)
+
+    [[ -n "$allowed" && "$allowed" -eq 0 ]]
+}
+
 backup_pdbs() {
     local namespace="${1:-all}"
     local backup_path="${BACKUP_DIR}/${TIMESTAMP}"
@@ -52,10 +64,20 @@ backup_pdbs() {
         if [[ -n "$pdbs" ]]; then
             mkdir -p "$backup_path/$ns"
             for pdb in $pdbs; do
-                echo "Backing up PDB: $pdb in namespace: $ns"
-                oc get pdb "$pdb" -n "$ns" -o yaml | \
-                    sed '/resourceVersion:/d; /uid:/d; /creationTimestamp:/d; /generation:/d; /selfLink:/d; /managedFields:/,/^[^ ]/{ /^[^ ]/!d; }' \
-                    > "$backup_path/$ns/${pdb}.yaml"
+                if pdb_allowed_disruptions "$pdb" "$ns"; then
+                    pods=$(oc get pdb "$pdb" -n "$ns" \
+                        -o jsonpath='{.status.expectedPods}' 2>/dev/null)
+                    if [[ "$pods" -eq 1 ]]; then
+                        echo "WARNING: PDB $pdb in namespace $ns protects a single pod."
+                        echo "         Drain/eviction will cause SERVICE DOWNTIME."
+                    fi
+                    echo "Backing up PDB: $pdb in namespace: $ns"
+                    oc get pdb "$pdb" -n "$ns" -o yaml | \
+                        sed '/resourceVersion:/d; /uid:/d; /creationTimestamp:/d; /generation:/d; /selfLink:/d; /managedFields:/,/^[^ ]/{ /^[^ ]/!d; }' \
+                        > "$backup_path/$ns/${pdb}.yaml"
+                else
+                    echo "Skipping PDB: $pdb in namespace: $ns (disruptionsAllowed > 0)"
+                fi
             done
         fi
     done
@@ -80,8 +102,12 @@ delete_pdbs() {
     for ns in $namespaces; do
         pdbs=$(oc get pdb -n "$ns" -o jsonpath='{.items[*].metadata.name}' 2>/dev/null)
         for pdb in $pdbs; do
-            echo "Deleting PDB: $pdb in namespace: $ns"
-            oc delete pdb "$pdb" -n "$ns" --force --grace-period=0
+            if pdb_allowed_disruptions "$pdb" "$ns"; then
+                echo "Deleting PDB: $pdb in namespace: $ns"
+                oc delete pdb "$pdb" -n "$ns" --force --grace-period=0
+            else
+                echo "Skipping PDB: $pdb in namespace: $ns (disruptionsAllowed > 0)"
+            fi
         done
     done
     
